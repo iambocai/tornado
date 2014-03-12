@@ -38,8 +38,23 @@ from tornado.escape import utf8
 from tornado import httputil, stack_context
 from tornado.ioloop import IOLoop
 from tornado.util import Configurable
+from tornado.options import define, options
+
+# global config Definition
+define("client_trace", default=True, help="Enable client trace.(default: True)")
+define("service_name", default='tornado', help="service name.(default: tornado)")
+define("scribe_client", default='127.0.0.1:9015', help="scribe_client.(default: 127.0.0.1:9015)")
+define("category", default='zipkin', help="category(default: zipkin)")
 
 
+# import libraries if trace enabled
+if options.server_trace:
+    from tryfer.tracers import push_tracer, ZipkinTracer
+    from tryfer.trace import Trace, Annotation, Endpoint
+    from tryfer.formatters import hex_str
+    ZipkinTracer(scribe_client=options.scribe_client, category=options.category, end_annotations=None,
+                 max_traces=50, max_idle_time=10, _reactor=None)
+    
 class HTTPClient(object):
     """A blocking HTTP client.
 
@@ -81,6 +96,7 @@ class HTTPClient(object):
 
         If an error occurs during the fetch, we raise an `HTTPError`.
         """
+        
         response = self._io_loop.run_sync(functools.partial(
             self._async_client.fetch, request, **kwargs))
         response.rethrow()
@@ -180,6 +196,8 @@ class AsyncHTTPClient(Configurable):
         # so make sure we don't modify the caller's object.  This is also
         # where normal dicts get converted to HTTPHeaders objects.
         request.headers = httputil.HTTPHeaders(request.headers)
+        if options.client_trace:
+            request.trace.record(Annotation.client_send())
         request = _RequestProxy(request, self.defaults)
         future = TracebackFuture()
         if callback is not None:
@@ -203,6 +221,8 @@ class AsyncHTTPClient(Configurable):
                 future.set_exception(response.error)
             else:
                 future.set_result(response)
+            if options.client_trace:
+                request.trace.record(Annotation.client_recv())
         self.fetch_impl(request, handle_response)
         return future
 
@@ -246,7 +266,9 @@ class HTTPRequest(object):
         use_gzip=True,
         proxy_password='',
         allow_nonstandard_methods=False,
-        validate_cert=True)
+        validate_cert=True,
+        parent_trace=None,
+        endpoint=None)
 
     def __init__(self, url, method="GET", headers=None, body=None,
                  auth_username=None, auth_password=None, auth_mode=None,
@@ -259,7 +281,8 @@ class HTTPRequest(object):
                  proxy_password=None, allow_nonstandard_methods=None,
                  validate_cert=None, ca_certs=None,
                  allow_ipv6=None,
-                 client_key=None, client_cert=None):
+                 client_key=None, client_cert=None,
+                 parent_trace=None, endpoint=None):
         r"""All parameters except ``url`` are optional.
 
         :arg string url: URL to fetch
@@ -319,6 +342,8 @@ class HTTPRequest(object):
            note below when used with ``curl_httpclient``.
         :arg string client_cert: Filename for client SSL certificate, if any.
            See note below when used with ``curl_httpclient``.
+        :arg string parent_trace: parent trace id.
+        :arg string endpoint: request endpoint.
 
         .. note::
 
@@ -368,6 +393,27 @@ class HTTPRequest(object):
         self.client_key = client_key
         self.client_cert = client_cert
         self.start_time = time.time()
+        self._parent_trace = parent_trace
+        self._endpoint = endpoint
+        self.trace = None
+        
+        if options.client_trace:
+            if self._parent_trace is None:
+                self.trace = Trace(method)
+            else:
+                self.trace = self._parent_trace.child(method)
+            if self._endpoint is not None:
+                self.trace.set_endpoint(self._endpoint)
+            else:
+                self._endpoint = Endpoint(ipv4=socket.gethostbyname(socket.gethostname()), port=0, service_name=service_name)
+                self.trace.set_endpoint(self._endpoint)
+            
+            self.headers.set('X-B3-TraceId', [hex_str(self.trace.trace_id)])
+            self.headers.set('X-B3-SpanId', [hex_str(self.trace.span_id)])
+            if trace.parent_span_id is not None:
+                self.headers.set('X-B3-ParentSpanId', [hex_str(self.trace.parent_span_id)])
+            
+            self.trace.record(Annotation.string('HTTPClient REQ', self.url))
 
     @property
     def headers(self):

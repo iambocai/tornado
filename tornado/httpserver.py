@@ -39,11 +39,28 @@ from tornado import netutil
 from tornado.tcpserver import TCPServer
 from tornado import stack_context
 from tornado.util import bytes_type
+from tornado.options import define, options
 
 try:
     import Cookie  # py2
 except ImportError:
     import http.cookies as Cookie  # py3
+
+# global config Definition
+define("server_trace", default=True, help="Enable server trace.(default: True)")
+define("port", default=80, help="server port.(default: 80)")
+define("service_name", default='tornado', help="service name.(default: tornado)")
+define("scribe_client", default='127.0.0.1:9015', help="scribe_client.(default: 127.0.0.1:9015)")
+define("category", default='zipkin', help="category(default: zipkin)")
+
+# import libraries if trace enabled
+if options.server_trace:
+    from tryfer.tracers import push_tracer, ZipkinTracer
+    from tryfer.trace import Trace, Annotation, Endpoint
+    from tryfer.formatters import hex_str
+    ZipkinTracer(scribe_client=options.scribe_client, category=options.category, end_annotations=None,
+                 max_traces=50, max_idle_time=10, _reactor=None)
+    
 
 
 class HTTPServer(TCPServer):
@@ -441,6 +458,7 @@ class HTTPRequest(object):
         self.version = version
         self.headers = headers or httputil.HTTPHeaders()
         self.body = body or ""
+        self.trace = None
 
         # set remote IP and protocol
         self.remote_ip = remote_ip
@@ -466,6 +484,16 @@ class HTTPRequest(object):
                 "X-Scheme", self.headers.get("X-Forwarded-Proto", self.protocol))
             if proto in ("http", "https"):
                 self.protocol = proto
+            # Zipkin users 
+            if options.server_trace:
+                parent_span_id = self.headers.get("X-B3-ParentSpanId", None)
+                trace_id = self.headers.get("X-B3-TraceId", None)
+                span_id = self.headers.get("X-B3-SpanId", None)
+                name =  method
+                endpoint = Endpoint(ipv4=socket.gethostbyname(socket.gethostname()), port=port, service_name=service_name)
+                
+                self.trace = Trace(name=name, trace_id=trace_id, span_id=span_id, parent_span_id=parent_span_id)
+                self.trace.set_endpoint(endpoint)
 
         self.host = host or self.headers.get("Host") or "127.0.0.1"
         self.files = files or {}
@@ -477,6 +505,11 @@ class HTTPRequest(object):
         self.arguments = parse_qs_bytes(self.query, keep_blank_values=True)
         self.query_arguments = copy.deepcopy(self.arguments)
         self.body_arguments = {}
+        
+        if options.server_trace:
+            self.trace.record(Annotation.string('Url', uri))
+            self.trace.record(Annotation.string('Header', self.headers))
+            self.trace.record(Annotation.server_recv())
 
     def supports_http_1_1(self):
         """Returns True if this request supports HTTP/1.1 semantics"""
@@ -501,10 +534,19 @@ class HTTPRequest(object):
         self.connection.write(chunk, callback=callback)
 
     def finish(self):
-        """Finishes this HTTP request on the open connection."""
+        """Finishes this HTTP request on the open connection."""       
+        if options.server_trace:
+            self.headers.set("X-B3-TraceId", [hex_str(self.trace.trace_id)])
+            self.headers.set("X-B3-SpanId", [hex_str(self.trace.span_id)])
+            
+            if self.trace.parent_span_id is not None:
+                self.headers.set("X-B3-ParentSpanId", [hex_str(self.trace.parent_span_id)])
+
+            self.trace.record(Annotation.server_send())
+            
         self.connection.finish()
         self._finish_time = time.time()
-
+        
     def full_url(self):
         """Reconstructs the full URL for this request."""
         return self.protocol + "://" + self.host + self.uri
